@@ -718,6 +718,9 @@ try {
 
     if ($missing.Count -gt 0) {
         Write-Log -Level ERROR -Message ("Missing required credential(s): {0}" -f ($missing -join ', '))
+        if ($AuthMode -eq 'ClientSecret') {
+            Write-Log -Level INFO -Message 'Supply the secret via -ClientSecret or $env:RENAMEDEVICE_CLIENT_SECRET, OR use -AuthMode Interactive to sign in as your admin (no secret, omit -ClientId).'
+        }
         exit $ExitFatal
     }
 
