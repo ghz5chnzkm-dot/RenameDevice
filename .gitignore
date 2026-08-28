@@ -1,0 +1,15 @@
+# Run artifacts — never commit logs, reports, or anything that may contain data
+logs/
+output/
+*.log
+
+# Local secrets / config
+*.secret
+*.env
+.env
+appsettings.local.json
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
