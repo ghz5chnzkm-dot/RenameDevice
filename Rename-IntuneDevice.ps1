@@ -36,15 +36,24 @@
 .PARAMETER Delimiter
     Single-character CSV delimiter. Default ','. Use ';' for typical European-locale exports.
 
+.PARAMETER AuthMode
+    How the script authenticates to Microsoft Graph:
+      * ClientSecret (default) : app-only (client credentials). Best for unattended / n8n.
+      * Interactive            : interactive delegated sign-in as YOUR admin account via the OAuth
+                                 authorization-code flow with PKCE (opens a browser; loopback redirect).
+                                 No app secret and no device code; ideal for a quick test on a machine
+                                 with a browser. Not for unattended use.
+
 .PARAMETER TenantId
     Entra tenant ID (GUID) or verified domain. Falls back to env var RENAMEDEVICE_TENANT_ID.
 
 .PARAMETER ClientId
     App registration (client) ID. Falls back to env var RENAMEDEVICE_CLIENT_ID.
+    For AuthMode DeviceCode this is optional and defaults to the Microsoft Graph public client.
 
 .PARAMETER ClientSecret
-    App registration client secret. PREFER supplying this via env var RENAMEDEVICE_CLIENT_SECRET
-    (avoids exposure in process listings / shell history). Used only to obtain the token.
+    App registration client secret (AuthMode ClientSecret only). PREFER supplying this via env var
+    RENAMEDEVICE_CLIENT_SECRET (avoids exposure in process listings / shell history).
 
 .PARAMETER DryRun
     Explicit preview mode. Same behaviour as running with no mode switch. No writes are performed.
@@ -92,6 +101,11 @@
     .\Rename-IntuneDevice.ps1 -CsvPath .\devices.csv -Rename -Force
     Applies renames unattended (credentials read from RENAMEDEVICE_* environment variables).
 
+.EXAMPLE
+    .\Rename-IntuneDevice.ps1 -CsvPath .\devices.csv -AuthMode Interactive -TenantId <tenant>
+    Interactive test as your admin: opens a browser to sign in, then previews suggested names.
+    No app registration or secret required.
+
 .NOTES
     Author       : Heidelberg Materials IT
     Created      : 2026-08-28
@@ -118,6 +132,9 @@ param(
 
     [ValidatePattern('^.$')]
     [string] $Delimiter = ',',
+
+    [ValidateSet('ClientSecret', 'Interactive')]
+    [string] $AuthMode = 'ClientSecret',
 
     [string] $TenantId,
 
@@ -164,6 +181,11 @@ $ErrorActionPreference = 'Stop'
 $ExitSuccess   = 0
 $ExitAttention = 1
 $ExitFatal     = 2
+
+# Public client "Microsoft Graph Command Line Tools" (present in every tenant); used as the
+# default client for interactive DeviceCode sign-in so no app registration is needed to test.
+$GraphPowerShellClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+$script:GraphScopes = @()
 
 $scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $runStamp   = (Get-Date).ToString('yyyyMMdd_HHmmss')
@@ -229,7 +251,7 @@ function Write-Log {
 function Get-GraphErrorDetail {
     param([Parameter(Mandatory = $true)] $ErrorRecord)
 
-    $info = [ordered]@{ StatusCode = $null; RetryAfter = $null; Message = $null }
+    $info = [ordered]@{ StatusCode = $null; RetryAfter = $null; Message = $null; Raw = $null }
     $ex   = $ErrorRecord.Exception
 
     try { if ($null -ne $ex.Response) { $info.StatusCode = [int]$ex.Response.StatusCode } } catch { }
@@ -250,6 +272,7 @@ function Get-GraphErrorDetail {
     }
 
     if ($body) {
+        $info.Raw = $body
         try {
             $parsed = $body | ConvertFrom-Json
             if ($parsed.error -and $parsed.error.message) { $info.Message = $parsed.error.message }
@@ -326,19 +349,167 @@ function Get-GraphToken {
         if (Get-Variable -Name plain -Scope Local -ErrorAction SilentlyContinue) { $plain = $null }
     }
 
-    $expiresIn = if ($resp.expires_in) { [int]$resp.expires_in } else { 3600 }
+    return (New-TokenCache -Response $resp)
+}
+
+function New-TokenCache {
+    # Normalize a token endpoint response into the script's token-cache shape.
+    param([Parameter(Mandatory = $true)] $Response)
+    $expiresIn = if ($Response.expires_in) { [int]$Response.expires_in } else { 3600 }
     return @{
-        AccessToken = $resp.access_token
+        AccessToken  = $Response.access_token
         # Refresh 2 minutes early to avoid mid-run expiry on long batches.
-        ExpiresOn   = (Get-Date).ToUniversalTime().AddSeconds($expiresIn - 120)
+        ExpiresOn    = (Get-Date).ToUniversalTime().AddSeconds($expiresIn - 120)
+        RefreshToken = $Response.refresh_token   # $null for client_credentials
     }
+}
+
+function Get-ScopeString {
+    param([string[]] $Scopes)
+    return ((($Scopes | ForEach-Object { "https://graph.microsoft.com/$_" }) -join ' ') + ' offline_access')
+}
+
+function ConvertTo-Base64Url {
+    param([Parameter(Mandatory = $true)][byte[]] $Bytes)
+    return ([Convert]::ToBase64String($Bytes)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+function ConvertFrom-HttpQueryString {
+    # Parse "a=1&b=hello%20world" into a hashtable of URL-decoded values.
+    param([string] $Query)
+    $result = @{}
+    if ([string]::IsNullOrEmpty($Query)) { return $result }
+    foreach ($pair in ($Query -split '&')) {
+        if (-not $pair) { continue }
+        $kv = $pair -split '=', 2
+        $key = [uri]::UnescapeDataString($kv[0])
+        $val = if ($kv.Count -gt 1) { [uri]::UnescapeDataString($kv[1]) } else { '' }
+        $result[$key] = $val
+    }
+    return $result
+}
+
+function Get-GraphTokenInteractive {
+    # Interactive delegated sign-in via OAuth 2.0 authorization code flow with PKCE and a
+    # loopback (http://localhost) redirect. Opens the default browser; no device code used.
+    param(
+        [Parameter(Mandatory = $true)][string] $TenantId,
+        [Parameter(Mandatory = $true)][string] $ClientId,
+        [Parameter(Mandatory = $true)][string[]] $Scopes,
+        [int] $TimeoutSeconds = 300
+    )
+
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $vbytes = New-Object byte[] 32; $rng.GetBytes($vbytes)
+        $verifier = ConvertTo-Base64Url -Bytes $vbytes
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $challenge = ConvertTo-Base64Url -Bytes ($sha.ComputeHash([System.Text.Encoding]::ASCII.GetBytes($verifier))) }
+        finally { $sha.Dispose() }
+        $sbytes = New-Object byte[] 16; $rng.GetBytes($sbytes)
+        $state = ConvertTo-Base64Url -Bytes $sbytes
+    }
+    finally { $rng.Dispose() }
+
+    # Reserve a free loopback port.
+    $probe = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Loopback, 0)
+    $probe.Start(); $port = ([System.Net.IPEndPoint]$probe.LocalEndpoint).Port; $probe.Stop()
+    $redirectUri = "http://localhost:$port"
+    $scopeStr    = Get-ScopeString -Scopes $Scopes
+
+    $authUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/authorize" +
+        "?client_id=$([uri]::EscapeDataString($ClientId))" +
+        "&response_type=code" +
+        "&redirect_uri=$([uri]::EscapeDataString($redirectUri))" +
+        "&response_mode=query" +
+        "&scope=$([uri]::EscapeDataString($scopeStr))" +
+        "&code_challenge=$challenge&code_challenge_method=S256" +
+        "&state=$state&prompt=select_account"
+
+    $listener = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Loopback, $port)
+    $listener.Start()
+    try {
+        Write-Host ''
+        Write-Host '  A browser window will open for sign-in. If it does not, open this URL manually:' -ForegroundColor Cyan
+        Write-Host "  $authUrl" -ForegroundColor DarkCyan
+        Write-Host ''
+        try { Start-Process $authUrl | Out-Null }
+        catch { Write-Log -Level WARN -Message 'Could not launch a browser automatically; open the URL above manually.' }
+        Write-Log -Level INFO -Message 'Waiting for interactive browser sign-in to complete...'
+
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        while (-not $listener.Pending()) {
+            if ((Get-Date) -ge $deadline) { throw 'Timed out waiting for interactive sign-in.' }
+            Start-Sleep -Milliseconds 300
+        }
+
+        $client = $listener.AcceptTcpClient()
+        try {
+            $stream = $client.GetStream()
+            $reader = New-Object System.IO.StreamReader($stream)
+            $requestLine = $reader.ReadLine()
+
+            $html = '<html><body style="font-family:Segoe UI,Arial,sans-serif"><h3>Sign-in complete.</h3><p>You can close this window and return to PowerShell.</p></body></html>'
+            $response = "HTTP/1.1 200 OK`r`nContent-Type: text/html; charset=utf-8`r`nContent-Length: $([System.Text.Encoding]::UTF8.GetByteCount($html))`r`nConnection: close`r`n`r`n$html"
+            $rbytes = [System.Text.Encoding]::UTF8.GetBytes($response)
+            $stream.Write($rbytes, 0, $rbytes.Length); $stream.Flush()
+        }
+        finally { $client.Close() }
+    }
+    finally { $listener.Stop() }
+
+    if ([string]::IsNullOrWhiteSpace($requestLine)) { throw 'No redirect was received from the browser.' }
+    $pathPart = ($requestLine -split ' ')[1]
+    $query    = ''
+    $qi = $pathPart.IndexOf('?'); if ($qi -ge 0) { $query = $pathPart.Substring($qi + 1) }
+    $qp = ConvertFrom-HttpQueryString -Query $query
+
+    if ($qp['error']) { throw ("Interactive sign-in failed: {0} - {1}" -f $qp['error'], $qp['error_description']) }
+    if (-not $qp['code']) { throw 'No authorization code was returned from sign-in.' }
+    if ($qp['state'] -ne $state) { throw 'State mismatch during interactive sign-in; aborting for safety.' }
+
+    $tokenUri = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+    $resp = Invoke-RestMethod -Method Post -Uri $tokenUri -ContentType 'application/x-www-form-urlencoded' `
+        -Body @{ client_id = $ClientId; grant_type = 'authorization_code'; code = $qp['code']; redirect_uri = $redirectUri; code_verifier = $verifier; scope = $scopeStr } -ErrorAction Stop
+    Write-Log -Level SUCCESS -Message 'Interactive sign-in completed.'
+    return (New-TokenCache -Response $resp)
+}
+
+function Get-GraphTokenByRefresh {
+    param(
+        [Parameter(Mandatory = $true)][string] $TenantId,
+        [Parameter(Mandatory = $true)][string] $ClientId,
+        [Parameter(Mandatory = $true)][string] $RefreshToken,
+        [Parameter(Mandatory = $true)][string[]] $Scopes
+    )
+    $uri = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+    $resp = Invoke-RestMethod -Method Post -Uri $uri -ContentType 'application/x-www-form-urlencoded' `
+        -Body @{ grant_type = 'refresh_token'; client_id = $ClientId; refresh_token = $RefreshToken; scope = (Get-ScopeString -Scopes $Scopes) } -ErrorAction Stop
+    return (New-TokenCache -Response $resp)
 }
 
 function Get-ValidToken {
     param([switch] $ForceRefresh)
-    if ($ForceRefresh -or $null -eq $script:TokenCache -or (Get-Date).ToUniversalTime() -ge $script:TokenCache.ExpiresOn) {
-        $script:TokenCache = Get-GraphToken -TenantId $script:TenantId -ClientId $script:ClientId -ClientSecret $script:ClientSecretSecure
+
+    if (-not $ForceRefresh -and $null -ne $script:TokenCache -and (Get-Date).ToUniversalTime() -lt $script:TokenCache.ExpiresOn) {
+        return $script:TokenCache.AccessToken
     }
+
+    if ($AuthMode -eq 'Interactive') {
+        # Prefer a silent refresh; fall back to a fresh interactive sign-in.
+        if ($null -ne $script:TokenCache -and $script:TokenCache.RefreshToken) {
+            try {
+                $script:TokenCache = Get-GraphTokenByRefresh -TenantId $script:TenantId -ClientId $script:ClientId -RefreshToken $script:TokenCache.RefreshToken -Scopes $script:GraphScopes
+                return $script:TokenCache.AccessToken
+            } catch {
+                Write-Log -Level WARN -Message 'Silent token refresh failed; requesting interactive sign-in again.'
+            }
+        }
+        $script:TokenCache = Get-GraphTokenInteractive -TenantId $script:TenantId -ClientId $script:ClientId -Scopes $script:GraphScopes
+        return $script:TokenCache.AccessToken
+    }
+
+    $script:TokenCache = Get-GraphToken -TenantId $script:TenantId -ClientId $script:ClientId -ClientSecret $script:ClientSecretSecure
     return $script:TokenCache.AccessToken
 }
 
@@ -514,28 +685,46 @@ try {
     Write-Log -Level INFO -Message ("Mode: {0}" -f $modeName)
 
     if ($doRename -and $Force) { $ConfirmPreference = 'None' }
+    Write-Log -Level INFO -Message ("Auth mode: {0}" -f $AuthMode)
+
+    # Delegated scopes requested for interactive sign-in (privileged only when renaming).
+    $script:GraphScopes = @('DeviceManagementManagedDevices.Read.All', 'DeviceManagementServiceConfig.Read.All')
+    if ($doRename) { $script:GraphScopes += 'DeviceManagementManagedDevices.PrivilegedOperations.All' }
 
     # Resolve credentials (parameters override, else environment variables).
     if (-not $TenantId)     { $TenantId     = $env:RENAMEDEVICE_TENANT_ID }
     if (-not $ClientId)     { $ClientId     = $env:RENAMEDEVICE_CLIENT_ID }
-    if (-not $ClientSecret) { $ClientSecret = $env:RENAMEDEVICE_CLIENT_SECRET }
-    elseif ($PSBoundParameters.ContainsKey('ClientSecret')) {
-        Write-Log -Level WARN -Message 'ClientSecret passed as a parameter; prefer the RENAMEDEVICE_CLIENT_SECRET environment variable for unattended runs.'
-    }
 
     $missing = @()
-    if ([string]::IsNullOrWhiteSpace($TenantId))     { $missing += 'TenantId (or RENAMEDEVICE_TENANT_ID)' }
-    if ([string]::IsNullOrWhiteSpace($ClientId))     { $missing += 'ClientId (or RENAMEDEVICE_CLIENT_ID)' }
-    if ([string]::IsNullOrWhiteSpace($ClientSecret)) { $missing += 'ClientSecret (or RENAMEDEVICE_CLIENT_SECRET)' }
+    if ([string]::IsNullOrWhiteSpace($TenantId)) { $missing += 'TenantId (or RENAMEDEVICE_TENANT_ID)' }
+
+    if ($AuthMode -eq 'ClientSecret') {
+        if (-not $ClientSecret) { $ClientSecret = $env:RENAMEDEVICE_CLIENT_SECRET }
+        elseif ($PSBoundParameters.ContainsKey('ClientSecret')) {
+            Write-Log -Level WARN -Message 'ClientSecret passed as a parameter; prefer the RENAMEDEVICE_CLIENT_SECRET environment variable for unattended runs.'
+        }
+        if ([string]::IsNullOrWhiteSpace($ClientId))     { $missing += 'ClientId (or RENAMEDEVICE_CLIENT_ID)' }
+        if ([string]::IsNullOrWhiteSpace($ClientSecret)) { $missing += 'ClientSecret (or RENAMEDEVICE_CLIENT_SECRET)' }
+    }
+    else {
+        # Interactive: no secret; default to the Microsoft Graph public client if none supplied.
+        if ([string]::IsNullOrWhiteSpace($ClientId)) {
+            $ClientId = $GraphPowerShellClientId
+            Write-Log -Level INFO -Message 'Using the default Microsoft Graph public client for interactive sign-in.'
+        }
+    }
+
     if ($missing.Count -gt 0) {
         Write-Log -Level ERROR -Message ("Missing required credential(s): {0}" -f ($missing -join ', '))
         exit $ExitFatal
     }
 
-    $script:TenantId           = $TenantId
-    $script:ClientId           = $ClientId
-    $script:ClientSecretSecure = ConvertTo-SecureString -String $ClientSecret -AsPlainText -Force
-    $ClientSecret = $null  # drop the plaintext copy
+    $script:TenantId = $TenantId
+    $script:ClientId = $ClientId
+    if ($AuthMode -eq 'ClientSecret') {
+        $script:ClientSecretSecure = ConvertTo-SecureString -String $ClientSecret -AsPlainText -Force
+        $ClientSecret = $null  # drop the plaintext copy
+    }
 
     # Load + validate CSV.
     if (-not (Test-Path -LiteralPath $CsvPath)) {
@@ -584,7 +773,11 @@ try {
         exit $ExitFatal
     }
 
-    # Validate connectivity / credentials up front (fail fast before the loop).
+    # Acquire the token up front: fail fast on bad app credentials, or prompt the
+    # interactive sign-in now (before the device loop) when AuthMode is Interactive.
+    if ($AuthMode -eq 'Interactive') {
+        Write-Log -Level INFO -Message 'Interactive sign-in required. A browser will open for you to authenticate as your admin.'
+    }
     $null = Get-ValidToken
     Write-Log -Level SUCCESS -Message 'Acquired Microsoft Graph access token.'
 
@@ -771,6 +964,7 @@ try {
     $jsonObject = [ordered]@{
         startedAtUtc   = (Get-Date).ToUniversalTime().ToString('o')
         mode           = $modeName
+        authMode       = $AuthMode
         tenantId       = $script:TenantId
         idColumn       = $IdColumnName
         totalInput     = $rows.Count

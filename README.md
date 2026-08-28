@@ -48,6 +48,16 @@ trigger "Restart after rename". The new name takes effect at the next user-initi
 
   > For a dry-run-only service principal you can omit `...PrivilegedOperations.All`.
 
+### Two ways to authenticate
+
+- **App-only (client secret)** — default (`-AuthMode ClientSecret`). Used for production and n8n.
+- **Interactive (sign in as your admin)** — `-AuthMode Interactive`. Opens a browser and you sign
+  in with your own admin account (OAuth authorization-code flow with PKCE, loopback redirect — **no
+  device code, no app secret**). Great for a quick test. The permissions above are the same, but
+  granted **delegated** to your account; you consent at first sign-in. Requires a machine with a
+  browser, and needs no app registration (it uses the built-in *Microsoft Graph Command Line Tools*
+  public client by default). Not suitable for unattended/n8n use.
+
 ### App registration (quick steps)
 
 1. Entra admin center → **App registrations** → **New registration**.
@@ -69,6 +79,18 @@ IntuneDeviceId
 ```
 
 ## Usage
+
+### Quick test as your admin (interactive, no app secret)
+
+Best first step. Opens a browser, you sign in as your admin, then it previews suggested names:
+```powershell
+.\Rename-IntuneDevice.ps1 -CsvPath .\devices.csv -AuthMode Interactive -TenantId <tenant-guid-or-domain>
+```
+Add `-Rename` (and `-Force` to skip the confirm) once the preview looks right. On first use you may
+be asked to **consent** to the Graph permissions — an admin can grant them at the sign-in prompt.
+Run this on a machine with a browser (loopback redirect is used; no device code).
+
+### App-only (production / unattended)
 
 **Preview (dry run) — no changes:**
 ```powershell
@@ -99,6 +121,7 @@ $env:RENAMEDEVICE_CLIENT_SECRET = '<secret>'
 | `-CsvPath` | *(required)* | Path to the input CSV. |
 | `-IdColumnName` | *(auto)* | CSV column holding the Intune device ID. |
 | `-Delimiter` | `,` | CSV delimiter (use `;` for many EU exports). |
+| `-AuthMode` | `ClientSecret` | `ClientSecret` (app-only) or `Interactive` (sign in as your admin, browser). |
 | `-DryRun` | *(default behavior)* | Preview only. Same as running with no mode switch. |
 | `-Rename` | off | Apply the rename via Graph. Ignored if `-DryRun` is also set (safety). |
 | `-Force` | off | Suppress the per-device confirmation prompt (required for unattended). |
