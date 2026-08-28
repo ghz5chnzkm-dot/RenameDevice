@@ -1,12 +1,12 @@
 # Rename-IntuneDevice
 
 Suggests and (optionally) applies a standardized device name to Intune-managed Windows
-devices, based on the country of the device's **Windows Autopilot deployment profile** and
-its hardware serial number.
+devices, based on the country in the device's **enrollment profile name** and its hardware
+serial number.
 
 ```
 Naming convention:  <CountryCode><CF><SerialNumber>
-                     └─ ISO 3166-1 alpha-3, derived from the Autopilot profile
+                     └─ ISO 3166-1 alpha-3, derived from the enrollment profile name
                                 └─ literal "CF"
                                         └─ hardware serial number from Intune
 
@@ -19,13 +19,15 @@ The parts are **joined with no separator** (Windows computer names cannot contai
 
 For each Intune managed device ID in your CSV, the script:
 
-1. Looks up the managed device in Microsoft Graph (serial number, current name, join type, OS).
-2. Resolves the device's assigned **Autopilot deployment profile** and extracts the trailing
-   ISO 3166-1 alpha-3 country code from its display name.
+1. Looks up the managed device in Microsoft Graph (serial number, current name, join type, OS,
+   and **`enrollmentProfileName`**).
+2. Extracts the trailing ISO 3166-1 alpha-3 country code from the enrollment profile name
+   (e.g. `"Autopilot User Driven profile MYS"` → `MYS`). If that field is empty, it falls back
+   to the assigned Autopilot deployment profile.
 3. Builds and validates the suggested name against Windows computer-name rules.
 4. **Dry-run (default):** prints the suggested name. **`-Rename`:** applies it via Graph.
 
-If a device has **no Autopilot deployment profile**, it is reported as needing
+If a device has **no enrollment/Autopilot profile**, it is reported as needing
 **re-enrollment** and is never renamed.
 
 ### No reboot
@@ -44,7 +46,7 @@ trigger "Restart after rename". The new name takes effect at the next user-initi
   |----------------------------------------------------------|-----|
   | `DeviceManagementManagedDevices.Read.All`                | Read managed devices (name, serial, join type, OS). |
   | `DeviceManagementManagedDevices.PrivilegedOperations.All`| Perform the rename (`setDeviceName`). Only needed for `-Rename`. |
-  | `DeviceManagementServiceConfig.Read.All`                 | Read Autopilot device identities and deployment profiles. |
+  | `DeviceManagementServiceConfig.Read.All`                 | Only for the Autopilot fallback; not needed when `enrollmentProfileName` is populated. |
 
   > For a dry-run-only service principal you can omit `...PrivilegedOperations.All`.
 

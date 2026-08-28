@@ -7,8 +7,9 @@
 .DESCRIPTION
     Reads a CSV of Intune managed device IDs (GUIDs), and for each device:
       1. Looks up the managed device in Microsoft Graph (serial number, current name, join type, OS).
-      2. Resolves the assigned Windows Autopilot deployment profile to derive the ISO 3166-1
-         alpha-3 country code (e.g. profile "Autopilot User Driven profile MYS" -> "MYS").
+      2. Reads the device's enrollment profile name (managedDevice.enrollmentProfileName) to derive
+         the ISO 3166-1 alpha-3 country code (e.g. "Autopilot User Driven profile MYS" -> "MYS").
+         Falls back to the assigned Autopilot deployment profile only if that field is empty.
       3. Builds the suggested name:  <CountryCode> + "CF" + <SerialNumber>  (parts joined, no separators).
       4. Validates the name against Windows computer-name rules (length + allowed characters).
 
@@ -19,8 +20,8 @@
                             ("Restart after rename" is intentionally not triggered). The new name
                             takes effect at the next user-initiated reboot.
 
-    If a device has no Autopilot deployment profile assigned, it is reported as requiring
-    re-enrollment (no country code can be derived) and is never renamed.
+    If a device has no enrollment/Autopilot profile, it is reported as requiring re-enrollment
+    (no country code can be derived) and is never renamed.
 
     Authentication is app-only (client credentials) against Microsoft Graph, suitable for
     unattended execution on a Windows Server and for orchestration platforms such as n8n.
@@ -115,7 +116,8 @@
     Required Microsoft Graph APPLICATION permissions (admin consent required):
       * DeviceManagementManagedDevices.Read.All                 (read managed devices)
       * DeviceManagementManagedDevices.PrivilegedOperations.All  (setDeviceName / rename)
-      * DeviceManagementServiceConfig.Read.All                   (read Autopilot profiles)
+      * DeviceManagementServiceConfig.Read.All                   (only for the Autopilot fallback;
+                                                                  not needed when enrollmentProfileName is populated)
 
     Exit codes (for orchestration / n8n):
       0 = completed, every device ended in a clean state (compliant / would-rename / renamed)
@@ -785,7 +787,7 @@ try {
     # Main processing loop
     # -----------------------------------------------------------------------
     $results   = New-Object System.Collections.Generic.List[object]
-    $mdSelect  = 'id,deviceName,serialNumber,operatingSystem,azureADDeviceId,joinType,manufacturer,model'
+    $mdSelect  = 'id,deviceName,serialNumber,operatingSystem,azureADDeviceId,joinType,enrollmentProfileName,manufacturer,model'
     $index     = 0
 
     foreach ($id in $ids) {
@@ -799,7 +801,8 @@ try {
             SerialNumber          = $null
             OperatingSystem       = $null
             JoinType              = $null
-            DeploymentProfileName = $null
+            ProfileName           = $null
+            ProfileSource         = $null
             CountryCode           = $null
             SuggestedName         = $null
             Status                = $null
@@ -860,20 +863,38 @@ try {
                 $results.Add([pscustomobject]$rec); continue
             }
 
-            # 3) Country code from Autopilot deployment profile.
-            $profileInfo = Resolve-AutopilotProfileName -ManagedDevice $md
-            if (-not $profileInfo.Found) {
+            # 3) Country code from the enrollment/Autopilot profile.
+            #    Primary source: managedDevice.enrollmentProfileName (authoritative, already fetched).
+            #    Fallback: the assigned Autopilot deployment profile (needs DeviceManagementServiceConfig.Read.All).
+            $profileName   = $null
+            $profileSource = $null
+            if (-not [string]::IsNullOrWhiteSpace($md.enrollmentProfileName)) {
+                $profileName   = ("$($md.enrollmentProfileName)").Trim()
+                $profileSource = 'enrollmentProfileName'
+            }
+            else {
+                try {
+                    $apInfo = Resolve-AutopilotProfileName -ManagedDevice $md
+                    if ($apInfo.Found) { $profileName = $apInfo.ProfileName; $profileSource = $apInfo.Source }
+                }
+                catch {
+                    Write-Log -Level WARN -Message ("[{0}] Autopilot profile fallback failed: {1}" -f $id, $_.Exception.Message)
+                }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($profileName)) {
                 $rec.Status  = 'Error-NoAutopilotProfile'
-                $rec.Message = 'No Autopilot deployment profile is assigned; device needs re-enrollment.'
+                $rec.Message = 'No enrollment/Autopilot profile found; device needs re-enrollment.'
                 Write-Log -Level ERROR -Message ("[{0}] {1}" -f $id, $rec.Message)
                 $results.Add([pscustomobject]$rec); continue
             }
-            $rec.DeploymentProfileName = $profileInfo.ProfileName
+            $rec.ProfileName   = $profileName
+            $rec.ProfileSource = $profileSource
 
-            $cc = Get-CountryCodeFromProfile -ProfileName $profileInfo.ProfileName
+            $cc = Get-CountryCodeFromProfile -ProfileName $profileName
             if (-not $cc) {
                 $rec.Status  = 'Error-CountryCodeParse'
-                $rec.Message = ("Could not derive a valid ISO 3166-1 alpha-3 country code from profile '{0}'." -f $profileInfo.ProfileName)
+                $rec.Message = ("Could not derive a valid ISO 3166-1 alpha-3 country code from profile '{0}'." -f $profileName)
                 Write-Log -Level ERROR -Message ("[{0}] {1}" -f $id, $rec.Message)
                 $results.Add([pscustomobject]$rec); continue
             }
