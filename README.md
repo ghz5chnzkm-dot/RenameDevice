@@ -15,9 +15,37 @@ Example:  profile "Autopilot User Driven profile MYS" + serial 0001234  ->  MYSC
 
 The parts are **joined with no separator** (Windows computer names cannot contain `+`).
 
+## Files
+
+Deploy all three together in the same folder:
+
+| File | Role |
+|------|------|
+| `IntuneGraphCommon.ps1` | Shared Graph library (auth, retry/throttling, `$batch`, logging). Dot-sourced — not run directly. |
+| `Get-IntuneGroupDevices.ps1` | **Collector.** Group ID → device members → enriched device records (JSON). |
+| `Rename-IntuneDevice.ps1` | **Renamer.** Consumes IDs (CSV) or enriched records (JSON/stdin) → previews or renames. |
+
+### The pipeline (efficient path)
+
+```
+Get-IntuneGroupDevices.ps1 -GroupId <guid>   →  enriched JSON (batched reads, 20/call)
+        │  stdout
+        ▼
+Rename-IntuneDevice.ps1 -Stdin               →  no per-device reads; only writes on -Rename
+```
+
+The collector does all the reads **in batches** and hands the renamer fully-enriched records
+(serial, enrollment profile, join type…), so the renamer performs **zero Graph reads** — it just
+computes names and, in `-Rename` mode, calls `setDeviceName`. Chain them by pipe:
+
+```powershell
+pwsh -File Get-IntuneGroupDevices.ps1 -GroupId <guid> |
+    pwsh -File Rename-IntuneDevice.ps1 -Stdin -Rename -Force -PassThruJson
+```
+
 ## What it does
 
-For each Intune managed device ID in your CSV, the script:
+For each device, the renamer:
 
 1. Looks up the managed device in Microsoft Graph (serial number, current name, join type, OS,
    and **`enrollmentProfileName`**).
@@ -47,8 +75,11 @@ trigger "Restart after rename". The new name takes effect at the next user-initi
   | `DeviceManagementManagedDevices.Read.All`                | Read managed devices (name, serial, join type, OS). |
   | `DeviceManagementManagedDevices.PrivilegedOperations.All`| Perform the rename (`setDeviceName`). Only needed for `-Rename`. |
   | `DeviceManagementServiceConfig.Read.All`                 | Only for the Autopilot fallback; not needed when `enrollmentProfileName` is populated. |
+  | `GroupMember.Read.All`                                   | **Collector only** — read the group's members. |
+  | `Device.Read.All`                                        | **Collector only** — read the Entra device objects. |
 
   > For a dry-run-only service principal you can omit `...PrivilegedOperations.All`.
+  > The same permission names apply as **delegated** scopes when you use `-AuthMode Interactive`.
 
 ### Two ways to authenticate
 
@@ -68,17 +99,39 @@ trigger "Restart after rename". The new name takes effect at the next user-initi
    three permissions above → **Grant admin consent**.
 4. Note the **Directory (tenant) ID** and **Application (client) ID**.
 
-## Input CSV
+## Input to the renamer
 
-A CSV containing a column of **Intune managed device IDs** (GUIDs). The column is auto-detected
-(`IntuneDeviceId`, `ManagedDeviceId`, `DeviceId`, or `Id`); otherwise pass `-IdColumnName`.
-A single-column file is accepted as-is. See [`examples/devices.sample.csv`](examples/devices.sample.csv).
+`Rename-IntuneDevice.ps1` takes **exactly one** input source:
 
-```csv
-IntuneDeviceId
-11111111-1111-1111-1111-111111111111
-22222222-2222-2222-2222-222222222222
+- **`-CsvPath`** — a CSV with a column of **Intune managed device IDs** (GUIDs). The column is
+  auto-detected (`IntuneDeviceId`, `ManagedDeviceId`, `DeviceId`, `Id`); otherwise pass
+  `-IdColumnName`. A single-column file is accepted as-is. See
+  [`examples/devices.sample.csv`](examples/devices.sample.csv).
+- **`-InputJson <file>`** — a JSON array of ID strings, or of device records.
+- **`-Stdin`** — the same JSON array piped in (e.g. from the collector).
+
+  ```csv
+  IntuneDeviceId
+  11111111-1111-1111-1111-111111111111
+  ```
+
+**Enriched records** (as produced by the collector — objects carrying at least `IntuneDeviceId`
+and `SerialNumber`) are used **as-is with no Graph read**. Bare ID strings (or CSV rows) are
+fetched from Graph per device.
+
+## Collector: `Get-IntuneGroupDevices.ps1`
+
+Turns a group into enriched device records:
+
+```powershell
+.\Get-IntuneGroupDevices.ps1 -GroupId <guid> -AuthMode Interactive -TenantId <tenant> -OutputPath .\devices.json
 ```
+
+- Reads the group's **transitive** device members by default (`-Transitive:$false` for direct only).
+- Resolves each Entra device to its Intune managed device in **batches** (`$batch`, 20 per call).
+- Emits a JSON array to **stdout** (and optionally a file via `-OutputPath`, `.json` or `.csv`).
+  All logs go to **stderr**, so stdout stays clean for piping.
+- Devices with no Intune record are logged and omitted (add `-IncludeUnenrolled` to include them).
 
 ## Usage
 
@@ -120,9 +173,10 @@ $env:RENAMEDEVICE_CLIENT_SECRET = '<secret>'
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `-CsvPath` | *(required)* | Path to the input CSV. |
+| `-CsvPath` / `-InputJson` / `-Stdin` | *(one required)* | Input source: CSV of IDs, a JSON file, or piped JSON. |
 | `-IdColumnName` | *(auto)* | CSV column holding the Intune device ID. |
 | `-Delimiter` | `,` | CSV delimiter (use `;` for many EU exports). |
+| `-PassThruJson` | off | Emit the run summary JSON to stdout (logs to stderr, no table). For n8n. |
 | `-AuthMode` | `ClientSecret` | `ClientSecret` (app-only) or `Interactive` (sign in as your admin, browser). |
 | `-DryRun` | *(default behavior)* | Preview only. Same as running with no mode switch. |
 | `-Rename` | off | Apply the rename via Graph. Ignored if `-DryRun` is also set (safety). |
@@ -157,7 +211,7 @@ Run `Get-Help .\Rename-IntuneDevice.ps1 -Full` for the complete reference.
 | `Error-NameTooLong` | Suggested name exceeds `-MaxNameLength` (default 15). |
 | `Error-InvalidName` | Suggested name breaks Windows naming rules. |
 | `Error-NotFound` | Device ID not found in Intune. |
-| `Error-InvalidInput` | CSV value is not a valid GUID. |
+| `Error-InvalidInput` | Input value is not a valid GUID (or a record with no managed-device ID). |
 | `Skipped-HybridJoined` | Entra hybrid-joined — rename via Intune is unsupported (rename in AD). |
 | `Skipped-NonWindows` | Device OS is not Windows. |
 | `RenameFailed` | The `setDeviceName` call failed (details in the message). |
@@ -168,25 +222,30 @@ Run `Get-Help .\Rename-IntuneDevice.ps1 -Full` for the complete reference.
 |------|---------|
 | `0` | Completed; every device is clean (compliant / would-rename / renamed). |
 | `1` | Completed, but one or more devices need attention (errors / skips / failures). |
-| `2` | Fatal (bad arguments, unreadable/empty CSV, authentication failure). |
+| `2` | Fatal (bad arguments, unreadable/empty input, authentication failure). |
 
-## Unattended execution with n8n (future)
+## Unattended execution with n8n
 
-The script is built for headless automation:
+Both scripts are built for headless automation:
 
 - Credentials come from `RENAMEDEVICE_TENANT_ID` / `RENAMEDEVICE_CLIENT_ID` /
   `RENAMEDEVICE_CLIENT_SECRET` environment variables — no secrets on the command line.
-- `-Force` suppresses all prompts.
-- The **exit code** signals success (`0`), attention (`1`), or fatal (`2`).
-- The **JSON summary** is a stable, parseable result for downstream nodes.
+- `-Force` suppresses all prompts; `-PassThruJson` writes a clean JSON result to stdout.
+- **Exit codes** signal success (`0`), attention (`1`), or fatal (`2`).
 
-**Execute Command** node example (secret supplied via the node's environment):
+**Option A — one Execute Command node, whole pipeline in a pipe:**
 ```bash
-pwsh -NoProfile -File /opt/scripts/Rename-IntuneDevice.ps1 \
-  -CsvPath /data/devices.csv \
-  -Rename -Force \
-  -JsonSummaryPath /data/rename-result.json
+pwsh -NoProfile -File /opt/scripts/Get-IntuneGroupDevices.ps1 -GroupId "$GROUP_ID" \
+  | pwsh -NoProfile -File /opt/scripts/Rename-IntuneDevice.ps1 -Stdin -Rename -Force -PassThruJson
 ```
+The node's stdout is the rename JSON summary; branch on the exit code.
+
+**Option B — two nodes.** Node 1 runs the collector and writes `-OutputPath /data/devices.json`;
+node 2 runs the renamer with `-InputJson /data/devices.json`. Recommended: run node 2 as a
+**dry run first** (omit `-Rename`), inspect the JSON, then run again with `-Rename -Force`.
+
+> All three files (`IntuneGraphCommon.ps1`, `Get-IntuneGroupDevices.ps1`, `Rename-IntuneDevice.ps1`)
+> must sit in the same folder — the two scripts dot-source the shared library.
 
 Then read `/data/rename-result.json` in a subsequent node, and branch on the exit code.
 Recommended flow: run a **dry run first** (omit `-Rename`), inspect the JSON, then run again
