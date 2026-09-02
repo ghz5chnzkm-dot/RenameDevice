@@ -1,0 +1,155 @@
+{
+  "name": "Intune - rename incorrectly named devices",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "f8d12e4c-cfec-4043-861d-cb07a35c4b4f",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "targetOs": "windows",
+        "script": "$ErrorActionPreference = 'Stop'\n# --- EDIT THESE TWO LINES ---\n$Base    = 'C:\\Scripts\\RenameDevice'          # folder with the .ps1 files (all 6, incl. IntuneGraphCommon.ps1)\n$GroupId = 'REPLACE_WITH_YOUR_GROUP_GUID'     # Entra/Intune group object ID\n# ----------------------------\n$Work = Join-Path $Base 'work'\nNew-Item -ItemType Directory -Path $Work -Force | Out-Null\n\n# Graph credentials come from machine environment variables set on this host:\n#   RENAMEDEVICE_TENANT_ID / RENAMEDEVICE_CLIENT_ID / RENAMEDEVICE_CLIENT_SECRET\n& (Join-Path $Base 'Get-IntuneGroupDevices.ps1') `\n    -GroupId $GroupId `\n    -OutputPath (Join-Path $Work 'devices.json')\nexit $LASTEXITCODE",
+        "options": {}
+      },
+      "type": "CUSTOM.powerShell",
+      "typeVersion": 1,
+      "position": [
+        220,
+        0
+      ],
+      "id": "a1000000-0000-4000-8000-000000000001",
+      "name": "Collect devices"
+    },
+    {
+      "parameters": {
+        "targetOs": "windows",
+        "script": "$ErrorActionPreference = 'Stop'\n$Base = 'C:\\Scripts\\RenameDevice'\n$Work = Join-Path $Base 'work'\n\n# Consumes the collector's enriched devices.json -> performs ZERO extra Graph reads.\n# Exit 0 = every device clean; exit 1 = some need attention (routes to this node's error output).\n& (Join-Path $Base 'Rename-IntuneDevice.ps1') `\n    -InputJson (Join-Path $Work 'devices.json') `\n    -Rename -Force -PassThruJson `\n    -JsonSummaryPath (Join-Path $Work 'rename-result.json')\nexit $LASTEXITCODE",
+        "options": {}
+      },
+      "type": "CUSTOM.powerShell",
+      "typeVersion": 1,
+      "position": [
+        460,
+        0
+      ],
+      "id": "a1000000-0000-4000-8000-000000000002",
+      "name": "Rename devices",
+      "onError": "continueErrorOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "targetOs": "windows",
+        "script": "$ErrorActionPreference = 'Stop'\n$Base = 'C:\\Scripts\\RenameDevice'\n$Work = Join-Path $Base 'work'\n\n# Every device clean -> resolve any open incident opened by a previous failing run (no-op if none).\n& (Join-Path $Base 'Close-ServiceNowIncident.ps1') `\n    -CorrelationId 'intune-rename-devices' `\n    -InputJson (Join-Path $Work 'rename-result.json')\nexit $LASTEXITCODE",
+        "options": {}
+      },
+      "type": "CUSTOM.powerShell",
+      "typeVersion": 1,
+      "position": [
+        720,
+        -112
+      ],
+      "id": "a1000000-0000-4000-8000-000000000003",
+      "name": "Close incident"
+    },
+    {
+      "parameters": {
+        "targetOs": "windows",
+        "script": "$ErrorActionPreference = 'Stop'\n$Base = 'C:\\Scripts\\RenameDevice'\n$Work = Join-Path $Base 'work'\n$summary = Join-Path $Work 'rename-result.json'\n\n# ServiceNow creds from env: SNOW_INSTANCE / SNOW_USER / SNOW_PASSWORD\n$a = @{\n    ShortDescription = 'Some devices need manual rename or reinstall'\n    CorrelationId    = 'intune-rename-devices'   # stable key: dedups here, closed by the same key\n    Urgency          = 3\n    OutputPath       = (Join-Path $Work 'incident.json')\n}\nif (Test-Path $summary) { $a.InputJson = $summary; $a.OnlyIfAttention = $true }\nelse { $a.Description = 'The Intune rename automation failed before producing a summary. Check the run logs.' }\n\n& (Join-Path $Base 'New-ServiceNowIncident.ps1') @a\nexit $LASTEXITCODE",
+        "options": {}
+      },
+      "type": "CUSTOM.powerShell",
+      "typeVersion": 1,
+      "position": [
+        720,
+        112
+      ],
+      "id": "a1000000-0000-4000-8000-000000000004",
+      "name": "Create incident"
+    },
+    {
+      "parameters": {
+        "operation": "sendAndWait",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.microsoftOutlook",
+      "typeVersion": 2,
+      "position": [
+        980,
+        112
+      ],
+      "id": "ce62c75e-6263-465b-b965-bf0381ae4452",
+      "name": "Send a message",
+      "webhookId": "31a9edae-11c6-4c5e-ba33-f853bd1956fc"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Collect devices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect devices": {
+      "main": [
+        [
+          {
+            "node": "Rename devices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rename devices": {
+      "main": [
+        [
+          {
+            "node": "Close incident",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create incident": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}
